@@ -1,0 +1,10 @@
+# Generated feed output and state
+new.xml
+random.xml
+snapshot.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
