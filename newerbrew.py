@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Generate RSS feeds for Homebrew.
 
-Two feeds are produced:
+Three feeds are produced:
 
-* ``new``    - formulae that were added or bumped to a new version since the
-               last run. State is tracked in a small JSON snapshot so the feed
-               reflects genuine changes between invocations.
-* ``random`` - a handful of randomly chosen formulae, for discovering projects
-               you might not otherwise stumble across.
+* ``new``     - software newly introduced to Homebrew since the last run, i.e.
+                packages that were not present in the previous snapshot.
+* ``updated`` - existing packages that have been bumped to a new version since
+                the last run.
+* ``random``  - a handful of randomly chosen packages, for discovering projects
+                you might not otherwise stumble across.
+
+State for ``new`` and ``updated`` is tracked in a small JSON snapshot so the
+feeds reflect genuine changes between invocations.
 
 Inspired by https://github.com/atheken/newbrew. Uses only the standard library,
 so there is nothing to ``pip install``.
@@ -111,42 +115,64 @@ def render_feed(title: str, link: str, description: str, items: list[str]) -> st
 # Feed builders
 # --------------------------------------------------------------------------- #
 
-def build_new_feed(current: dict[str, dict], snapshot_path: Path) -> str:
-    """Compare against the saved snapshot and emit added/updated packages."""
-    previous: dict[str, str] = {}
+def load_snapshot(snapshot_path: Path) -> dict[str, str]:
+    """Load the saved name -> version map, or empty if there is none yet."""
     if snapshot_path.exists():
-        previous = json.loads(snapshot_path.read_text())
+        return json.loads(snapshot_path.read_text())
+    return {}
 
-    items: list[str] = []
-    for name, pkg in sorted(current.items()):
-        old = previous.get(name)
-        if old is None:
-            title = f"New {pkg['kind']}: {name} {pkg['version']}"
-            desc = pkg["desc"] or "Newly added to Homebrew."
-            items.append(rss_item(pkg, title, desc))
-        elif old != pkg["version"]:
-            title = f"{name} updated: {old} -> {pkg['version']}"
-            desc = pkg["desc"] or f"Bumped from {old} to {pkg['version']}."
-            items.append(rss_item(pkg, title, desc))
 
-    # Persist the new snapshot for the next run.
+def save_snapshot(current: dict[str, dict], snapshot_path: Path) -> None:
+    """Persist the current name -> version map for the next run."""
     snapshot = {name: pkg["version"] for name, pkg in current.items()}
     snapshot_path.write_text(json.dumps(snapshot, sort_keys=True))
 
-    if not previous:
-        # First run: nothing to diff against, so don't flood the feed.
-        return render_feed(
-            "Homebrew: New & Updated",
-            "https://formulae.brew.sh",
-            "Formulae and casks added or updated. Baseline captured; "
-            "changes will appear on the next run.",
-            [],
-        )
 
+def build_new_feed(current: dict[str, dict], previous: dict[str, str]) -> str:
+    """Emit packages newly introduced to Homebrew since the last snapshot."""
+    items: list[str] = []
+    if previous:
+        for name, pkg in sorted(current.items()):
+            if name not in previous:
+                title = f"New {pkg['kind']}: {name} {pkg['version']}"
+                desc = pkg["desc"] or "Newly added to Homebrew."
+                items.append(rss_item(pkg, title, desc))
+
+    description = (
+        "Software newly added to Homebrew since the last check."
+        if previous
+        else "Newly added Homebrew packages. Baseline captured; "
+        "new software will appear on the next run."
+    )
     return render_feed(
-        "Homebrew: New & Updated",
+        "Homebrew: New Packages",
         "https://formulae.brew.sh",
-        "Formulae and casks added or updated since the last check.",
+        description,
+        items,
+    )
+
+
+def build_updated_feed(current: dict[str, dict], previous: dict[str, str]) -> str:
+    """Emit existing packages that were bumped to a new version."""
+    items: list[str] = []
+    if previous:
+        for name, pkg in sorted(current.items()):
+            old = previous.get(name)
+            if old is not None and old != pkg["version"]:
+                title = f"{name} updated: {old} -> {pkg['version']}"
+                desc = pkg["desc"] or f"Bumped from {old} to {pkg['version']}."
+                items.append(rss_item(pkg, title, desc))
+
+    description = (
+        "Existing Homebrew packages bumped to a new version since the last check."
+        if previous
+        else "Updated Homebrew packages. Baseline captured; "
+        "version bumps will appear on the next run."
+    )
+    return render_feed(
+        "Homebrew: Updated Packages",
+        "https://formulae.brew.sh",
+        description,
         items,
     )
 
@@ -177,8 +203,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "feed",
-        choices=["new", "random", "both"],
-        help="Which feed to generate.",
+        choices=["new", "updated", "random", "all"],
+        help="Which feed to generate ('all' generates every feed).",
     )
     parser.add_argument(
         "-o", "--outdir",
@@ -215,17 +241,29 @@ def main(argv: list[str] | None = None) -> int:
         current.update(normalize(fetch(CASK_API), "cask"))
     print(f"Loaded {len(current)} packages.", file=sys.stderr)
 
-    if args.feed in ("new", "both"):
-        xml = build_new_feed(current, snapshot_path)
+    previous = load_snapshot(snapshot_path)
+
+    if args.feed in ("new", "all"):
+        xml = build_new_feed(current, previous)
         path = args.outdir / "new.xml"
         path.write_text(xml)
         print(f"Wrote {path}", file=sys.stderr)
 
-    if args.feed in ("random", "both"):
+    if args.feed in ("updated", "all"):
+        xml = build_updated_feed(current, previous)
+        path = args.outdir / "updated.xml"
+        path.write_text(xml)
+        print(f"Wrote {path}", file=sys.stderr)
+
+    if args.feed in ("random", "all"):
         xml = build_random_feed(current, args.count)
         path = args.outdir / "random.xml"
         path.write_text(xml)
         print(f"Wrote {path}", file=sys.stderr)
+
+    # Persist the snapshot once, after every feed has diffed against it.
+    if args.feed in ("new", "updated", "all"):
+        save_snapshot(current, snapshot_path)
 
     return 0
 
