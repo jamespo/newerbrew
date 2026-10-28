@@ -6,7 +6,9 @@ Generate RSS feeds for [Homebrew](https://brew.sh) packages. Inspired by
 Three feeds are produced:
 
 - **`new`** — software **newly introduced** to Homebrew since the last run,
-  i.e. formulae (and optionally casks) that weren't present before.
+  i.e. formulae (and optionally casks) that weren't present before. On runs
+  where nothing new has landed, it replays the last `--count` arrivals instead
+  of going empty.
 - **`updated`** — existing packages that were **bumped to a new version**
   since the last run.
 - **`random`** — a handful of randomly chosen packages, for discovering
@@ -33,7 +35,7 @@ python3 newerbrew.py all -o ./public      # write feeds + snapshot elsewhere
 | `feed`            | (required)         | One of `new`, `updated`, `random`, or `all`.       |
 | `-o`, `--outdir`  | `.`                | Directory to write the feed XML into.              |
 | `--snapshot PATH` | `<outdir>/snapshot.json` | Where the version snapshot is stored.        |
-| `--count N`       | `15`               | Number of packages in the random feed.             |
+| `--count N`       | `15`               | Packages in the random feed; also how many past arrivals the `new` feed replays when nothing is new. |
 | `--casks`         | off                | Include casks in addition to formulae.             |
 
 ## How the `new` and `updated` feeds work
@@ -43,9 +45,17 @@ compares it against a saved snapshot (`snapshot.json`). Packages absent from the
 snapshot become `new` feed items; packages present but at a different version
 become `updated` feed items. The snapshot is then rewritten for the next run.
 
+Homebrew's API carries no "date added" field, so the script remembers arrivals
+itself: each package the `new` feed reports is appended to a `history` list in
+the snapshot alongside the timestamp it was first seen (the last 200 are kept).
+A run that finds nothing new replays the most recent `--count` entries from
+that history, each keeping its original `pubDate`, so the feed always has
+content and readers still dedupe on `guid`.
+
 The **first run** has nothing to diff against, so it captures a baseline and
 emits empty feeds rather than dumping every package. Changes appear from the
-second run onward. For a live feed, run it on a schedule with a stable
+second run onward, and the `new` feed's fallback kicks in once at least one
+arrival has been recorded. For a live feed, run it on a schedule with a stable
 `--snapshot` path so state persists:
 
 ```cron
@@ -56,8 +66,10 @@ second run onward. For a live feed, run it on a schedule with a stable
 ## Output
 
 - `new.xml` / `updated.xml` / `random.xml` — RSS 2.0 feeds.
-- `snapshot.json` — version state used to diff the `new` and `updated` feeds
-  between runs.
+- `snapshot.json` — `versions` (the name → version map used to diff the `new`
+  and `updated` feeds between runs) plus `history` (recent arrivals, for the
+  `new` feed's fallback). Snapshots from before `history` existed are still
+  read correctly, so upgrading doesn't reset the baseline.
 
 These are generated artifacts and are git-ignored.
 

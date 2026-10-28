@@ -4,7 +4,9 @@
 Three feeds are produced:
 
 * ``new``     - software newly introduced to Homebrew since the last run, i.e.
-                packages that were not present in the previous snapshot.
+                packages that were not present in the previous snapshot. When a
+                run turns up nothing, the feed falls back to the most recently
+                added packages the script has seen before.
 * ``updated`` - existing packages that have been bumped to a new version since
                 the last run.
 * ``random``  - a handful of randomly chosen packages, for discovering projects
@@ -34,6 +36,10 @@ CASK_API = "https://formulae.brew.sh/api/cask.json"
 FORMULA_PAGE = "https://formulae.brew.sh/formula/{name}"
 CASK_PAGE = "https://formulae.brew.sh/cask/{name}"
 USER_AGENT = "newerbrew/1.0 (+https://github.com/atheken/newbrew)"
+
+# How many past arrivals to remember, so the ``new`` feed has something to show
+# on runs that turn up nothing. Generous enough to cover any sane ``--count``.
+HISTORY_LIMIT = 200
 
 
 def fetch(url: str) -> list[dict]:
@@ -78,10 +84,15 @@ def normalize(packages: list[dict], kind: str) -> dict[str, dict]:
 # RSS rendering
 # --------------------------------------------------------------------------- #
 
-def rss_item(pkg: dict, title: str, description: str) -> str:
+def rss_item(
+    pkg: dict,
+    title: str,
+    description: str,
+    published: datetime | None = None,
+) -> str:
     link = escape(pkg["url"])
     guid = f"{link}#{escape(pkg['version'])}"
-    pubdate = format_datetime(datetime.now(timezone.utc))
+    pubdate = format_datetime(published or datetime.now(timezone.utc))
     return (
         "    <item>\n"
         f"      <title>{escape(title)}</title>\n"
@@ -115,35 +126,89 @@ def render_feed(title: str, link: str, description: str, items: list[str]) -> st
 # Feed builders
 # --------------------------------------------------------------------------- #
 
-def load_snapshot(snapshot_path: Path) -> dict[str, str]:
-    """Load the saved name -> version map, or empty if there is none yet."""
-    if snapshot_path.exists():
-        return json.loads(snapshot_path.read_text())
-    return {}
+def load_snapshot(snapshot_path: Path) -> tuple[dict[str, str], list[dict]]:
+    """Load the saved name -> version map and the arrival history.
+
+    Snapshots written by earlier versions are a bare name -> version map with
+    no history; they are read as such so upgrading does not reset the baseline.
+    """
+    if not snapshot_path.exists():
+        return {}, []
+    data = json.loads(snapshot_path.read_text())
+    if "versions" not in data:
+        return data, []
+    history = [entry for entry in data.get("history", []) if "url" in entry]
+    return data["versions"], history
 
 
-def save_snapshot(current: dict[str, dict], snapshot_path: Path) -> None:
-    """Persist the current name -> version map for the next run."""
-    snapshot = {name: pkg["version"] for name, pkg in current.items()}
+def save_snapshot(
+    current: dict[str, dict], history: list[dict], snapshot_path: Path
+) -> None:
+    """Persist the current versions and arrival history for the next run."""
+    snapshot = {
+        "versions": {name: pkg["version"] for name, pkg in current.items()},
+        "history": history,
+    }
     snapshot_path.write_text(json.dumps(snapshot, sort_keys=True))
 
 
-def build_new_feed(current: dict[str, dict], previous: dict[str, str]) -> str:
-    """Emit packages newly introduced to Homebrew since the last snapshot."""
-    items: list[str] = []
-    if previous:
-        for name, pkg in sorted(current.items()):
-            if name not in previous:
-                title = f"New {pkg['kind']}: {name} {pkg['version']}"
-                desc = pkg["desc"] or "Newly added to Homebrew."
-                items.append(rss_item(pkg, title, desc))
+def find_new(current: dict[str, dict], previous: dict[str, str]) -> list[dict]:
+    """Packages present now but absent from the previous snapshot."""
+    if not previous:
+        return []
+    return [pkg for name, pkg in sorted(current.items()) if name not in previous]
 
-    description = (
-        "Software newly added to Homebrew since the last check."
-        if previous
-        else "Newly added Homebrew packages. Baseline captured; "
-        "new software will appear on the next run."
-    )
+
+def record_arrivals(history: list[dict], arrivals: list[dict]) -> list[dict]:
+    """Prepend this run's arrivals to the history, newest first and capped."""
+    seen = datetime.now(timezone.utc).isoformat()
+    fresh = [dict(pkg, seen=seen) for pkg in arrivals]
+    return (fresh + history)[:HISTORY_LIMIT]
+
+
+def new_item(entry: dict) -> str:
+    """Render one arrival, dated by when we first saw it."""
+    title = f"New {entry['kind']}: {entry['name']} {entry['version']}"
+    desc = entry["desc"] or "Newly added to Homebrew."
+    published = None
+    if entry.get("seen"):
+        try:
+            published = datetime.fromisoformat(entry["seen"])
+        except ValueError:
+            pass
+    return rss_item(entry, title, desc, published)
+
+
+def build_new_feed(
+    arrivals: list[dict],
+    history: list[dict],
+    count: int,
+    have_baseline: bool,
+) -> str:
+    """Emit packages newly introduced to Homebrew since the last snapshot.
+
+    With nothing new this run, replay the most recent ``count`` arrivals from
+    the history so the feed is never empty between changes.
+    """
+    if arrivals:
+        items = [new_item(entry) for entry in arrivals]
+        description = "Software newly added to Homebrew since the last check."
+    elif history:
+        items = [new_item(entry) for entry in history[:count]]
+        description = (
+            f"No new Homebrew packages since the last check; showing the "
+            f"{len(items)} most recently added."
+        )
+    else:
+        items = []
+        description = (
+            "Newly added Homebrew packages. No arrivals recorded yet; "
+            "new software will appear here as it lands."
+            if have_baseline
+            else "Newly added Homebrew packages. Baseline captured; "
+            "new software will appear on the next run."
+        )
+
     return render_feed(
         "Homebrew: New Packages",
         "https://formulae.brew.sh",
@@ -222,7 +287,8 @@ def main(argv: list[str] | None = None) -> int:
         "--count",
         type=int,
         default=15,
-        help="Number of packages in the random feed (default: 15).",
+        help="Number of packages in the random feed, and of past arrivals "
+             "replayed in the new feed when nothing is new (default: 15).",
     )
     parser.add_argument(
         "--casks",
@@ -241,10 +307,16 @@ def main(argv: list[str] | None = None) -> int:
         current.update(normalize(fetch(CASK_API), "cask"))
     print(f"Loaded {len(current)} packages.", file=sys.stderr)
 
-    previous = load_snapshot(snapshot_path)
+    previous, history = load_snapshot(snapshot_path)
+    arrivals = find_new(current, previous)
+
+    # Record arrivals whenever we touch the snapshot, so the history keeps up
+    # even on runs that only build the `updated` feed.
+    if args.feed in ("new", "updated", "all"):
+        history = record_arrivals(history, arrivals)
 
     if args.feed in ("new", "all"):
-        xml = build_new_feed(current, previous)
+        xml = build_new_feed(arrivals, history, args.count, bool(previous))
         path = args.outdir / "new.xml"
         path.write_text(xml)
         print(f"Wrote {path}", file=sys.stderr)
@@ -263,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Persist the snapshot once, after every feed has diffed against it.
     if args.feed in ("new", "updated", "all"):
-        save_snapshot(current, snapshot_path)
+        save_snapshot(current, history, snapshot_path)
 
     return 0
 
